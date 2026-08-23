@@ -1,23 +1,103 @@
 #include "http_server.h"
 #include "stats.h"
 #include "blocklist.h"
+#include "overrides.h"
+#include "wifi.h"
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "http";
 
 extern const uint8_t dashboard_html_start[] asm("_binary_dashboard_html_start");
 extern const uint8_t dashboard_html_end[]   asm("_binary_dashboard_html_end");
+extern const uint8_t provision_html_start[] asm("_binary_provision_html_start");
+extern const uint8_t provision_html_end[]   asm("_binary_provision_html_end");
 
-#define JSON_MAX 3072
+#define JSON_MAX  8192
+#define BODY_MAX  512
+
+/* ---- request body helpers -------------------------------------------------
+   Everything is form-encoded in a POST body rather than a query string:
+   credentials must not end up in URLs, which get logged and cached. */
+
+static int read_body(httpd_req_t *req, char *buf, size_t max)
+{
+    if (req->content_len == 0 || req->content_len >= max) return -1;
+    int got = httpd_req_recv(req, buf, req->content_len);
+    if (got <= 0) return -1;
+    buf[got] = '\0';
+    return got;
+}
+
+static void urldecode(char *s)
+{
+    char *o = s;
+    for (char *i = s; *i; i++) {
+        if (*i == '+') {
+            *o++ = ' ';
+        } else if (*i == '%' && i[1] && i[2]) {
+            char h[3] = { i[1], i[2], 0 };
+            *o++ = (char)strtol(h, NULL, 16);
+            i += 2;
+        } else {
+            *o++ = *i;
+        }
+    }
+    *o = '\0';
+}
+
+/* Extracts `key` from a form-encoded body into out. */
+static bool field(const char *body, const char *key, char *out, size_t max)
+{
+    size_t klen = strlen(key);
+    for (const char *p = body; p && *p; ) {
+        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
+            const char *v = p + klen + 1;
+            const char *end = strchr(v, '&');
+            size_t len = end ? (size_t)(end - v) : strlen(v);
+            if (len >= max) return false;
+            memcpy(out, v, len);
+            out[len] = '\0';
+            urldecode(out);
+            return out[0] != '\0';
+        }
+        p = strchr(p, '&');
+        if (p) p++;
+    }
+    return false;
+}
+
+static esp_err_t reply_err(httpd_req_t *req, esp_err_t e)
+{
+    if (e == ESP_OK) {
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"ok\":true}");
+    }
+    const char *msg = e == ESP_ERR_NO_MEM      ? "list full"
+                    : e == ESP_ERR_INVALID_ARG ? "invalid domain or IP"
+                    : e == ESP_ERR_NOT_FOUND   ? "not found"
+                                               : "failed";
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    char b[96];
+    snprintf(b, sizeof(b), "{\"ok\":false,\"error\":\"%s\"}", msg);
+    return httpd_resp_sendstr(req, b);
+}
+
+/* ---- handlers ------------------------------------------------------------ */
 
 static esp_err_t page_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    if (wifi_is_provisioning())
+        return httpd_resp_send(req, (const char *)provision_html_start,
+                               provision_html_end - provision_html_start - 1);
     return httpd_resp_send(req, (const char *)dashboard_html_start,
                            dashboard_html_end - dashboard_html_start - 1);
 }
@@ -38,7 +118,7 @@ static int append_top(char *p, size_t left, const stats_entry_t *t)
 
 static esp_err_t stats_get(httpd_req_t *req)
 {
-    /* Both of these are too big for the httpd task stack, so they go on the heap. */
+    /* Both are far too big for the httpd task stack. */
     stats_snapshot_t *s = malloc(sizeof(*s));
     char *json = malloc(JSON_MAX);
     if (!s || !json) {
@@ -52,13 +132,14 @@ static esp_err_t stats_get(httpd_req_t *req)
         "{\"queries\":%lu,\"blocked\":%lu,\"forwarded\":%lu,"
         "\"upstream_fail\":%lu,\"dropped\":%lu,\"uptime_s\":%lu,"
         "\"free_heap\":%lu,\"min_free_heap\":%lu,"
-        "\"list_count\":%lu,\"list_ready\":%s,\"hour_index\":%lu,",
+        "\"list_count\":%lu,\"list_ready\":%s,\"upstream\":\"%s\","
+        "\"ip\":\"%s\",\"hour_index\":%lu,",
         (unsigned long)s->queries, (unsigned long)s->blocked,
         (unsigned long)s->forwarded, (unsigned long)s->upstream_fail,
         (unsigned long)s->dropped, (unsigned long)s->uptime_s,
         (unsigned long)s->free_heap, (unsigned long)s->min_free_heap,
         (unsigned long)blocklist_count(), blocklist_ready() ? "true" : "false",
-        (unsigned long)s->hour_index);
+        wifi_upstream_dns(), wifi_ip_str(), (unsigned long)s->hour_index);
 
     n += snprintf(json + n, JSON_MAX - n, "\"hourly_q\":[");
     for (int i = 0; i < STATS_HOURS; i++)
@@ -72,6 +153,21 @@ static esp_err_t stats_get(httpd_req_t *req)
     n += append_top(json + n, JSON_MAX - n, s->top_blocked);
     n += snprintf(json + n, JSON_MAX - n, ",\"top_queried\":");
     n += append_top(json + n, JSON_MAX - n, s->top_queried);
+
+    /* Newest first: walk backwards from the ring head. */
+    n += snprintf(json + n, JSON_MAX - n, ",\"recent\":[");
+    int first = 1;
+    for (int i = 1; i <= STATS_RECENT; i++) {
+        const stats_recent_t *r =
+            &s->recent[(s->recent_head + STATS_RECENT - i) % STATS_RECENT];
+        if (r->name[0] == '\0') continue;
+        n += snprintf(json + n, JSON_MAX - n, "%s{\"n\":\"%s\",\"v\":%u,\"a\":%lu}",
+                      first ? "" : ",", r->name, r->verdict,
+                      (unsigned long)(s->uptime_s - r->at_s));
+        first = 0;
+    }
+    n += snprintf(json + n, JSON_MAX - n, "],");
+    n += overrides_json(json + n, JSON_MAX - n);
     n += snprintf(json + n, JSON_MAX - n, "}");
 
     httpd_resp_set_type(req, "application/json");
@@ -81,11 +177,53 @@ static esp_err_t stats_get(httpd_req_t *req)
     return err;
 }
 
+static esp_err_t allow_post(httpd_req_t *req)
+{
+    char body[BODY_MAX], d[OV_NAME_MAX];
+    if (read_body(req, body, sizeof(body)) < 0 || !field(body, "d", d, sizeof(d)))
+        return reply_err(req, ESP_ERR_INVALID_ARG);
+    bool remove = strstr(req->uri, "/del") != NULL;
+    return reply_err(req, remove ? overrides_allow_del(d) : overrides_allow_add(d));
+}
+
+static esp_err_t rewrite_post(httpd_req_t *req)
+{
+    char body[BODY_MAX], d[OV_NAME_MAX], ip[20];
+    if (read_body(req, body, sizeof(body)) < 0 || !field(body, "d", d, sizeof(d)))
+        return reply_err(req, ESP_ERR_INVALID_ARG);
+    if (strstr(req->uri, "/del")) return reply_err(req, overrides_rw_del(d));
+    if (!field(body, "ip", ip, sizeof(ip)))
+        return reply_err(req, ESP_ERR_INVALID_ARG);
+    return reply_err(req, overrides_rw_add(d, ip));
+}
+
+static esp_err_t wifi_post(httpd_req_t *req)
+{
+    char body[BODY_MAX], ssid[33], pass[65];
+    if (read_body(req, body, sizeof(body)) < 0 || !field(body, "ssid", ssid, sizeof(ssid)))
+        return reply_err(req, ESP_ERR_INVALID_ARG);
+    if (!field(body, "pass", pass, sizeof(pass))) pass[0] = '\0';   /* open network */
+
+    esp_err_t err = wifi_save_credentials(ssid, pass);
+    /* Wipe the plaintext before it can linger on the httpd stack. */
+    memset(body, 0, sizeof(body));
+    memset(pass, 0, sizeof(pass));
+    if (err != ESP_OK) return reply_err(req, err);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"ok\":true,\"msg\":\"saved, rebooting\"}");
+    ESP_LOGI(TAG, "credentials saved, restarting");
+    vTaskDelay(pdMS_TO_TICKS(600));       /* let the response flush */
+    esp_restart();
+    return ESP_OK;
+}
+
 void http_server_start(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.stack_size = 5120;
+    cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
+    cfg.max_uri_handlers = 10;
     /* Below the DNS tasks on purpose: name resolution must never wait on a
        browser refreshing a chart. */
     cfg.task_priority = 3;
@@ -95,9 +233,18 @@ void http_server_start(void)
         ESP_LOGE(TAG, "httpd_start failed — dashboard unavailable");
         return;
     }
-    httpd_uri_t page  = { .uri = "/",           .method = HTTP_GET, .handler = page_get };
-    httpd_uri_t stats = { .uri = "/api/stats",  .method = HTTP_GET, .handler = stats_get };
-    httpd_register_uri_handler(srv, &page);
-    httpd_register_uri_handler(srv, &stats);
-    ESP_LOGI(TAG, "dashboard on :80");
+
+    static const httpd_uri_t routes[] = {
+        { .uri = "/",                 .method = HTTP_GET,  .handler = page_get },
+        { .uri = "/api/stats",        .method = HTTP_GET,  .handler = stats_get },
+        { .uri = "/api/allow",        .method = HTTP_POST, .handler = allow_post },
+        { .uri = "/api/allow/del",    .method = HTTP_POST, .handler = allow_post },
+        { .uri = "/api/rewrite",      .method = HTTP_POST, .handler = rewrite_post },
+        { .uri = "/api/rewrite/del",  .method = HTTP_POST, .handler = rewrite_post },
+        { .uri = "/api/wifi",         .method = HTTP_POST, .handler = wifi_post },
+    };
+    for (size_t i = 0; i < sizeof(routes) / sizeof(*routes); i++)
+        httpd_register_uri_handler(srv, &routes[i]);
+
+    ESP_LOGI(TAG, "%s on :80", wifi_is_provisioning() ? "provisioning portal" : "dashboard");
 }

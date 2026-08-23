@@ -18,6 +18,8 @@ static uint32_t s_hourly_b[STATS_HOURS];
 static uint32_t s_hour;                     /* current bucket index */
 static stats_entry_t s_top_blocked[STATS_TOP_N];
 static stats_entry_t s_top_queried[STATS_TOP_N];
+static stats_recent_t s_recent[STATS_RECENT];
+static uint32_t s_recent_head;
 
 static uint32_t uptime_s(void)
 {
@@ -61,17 +63,24 @@ static void top_bump(stats_entry_t *tbl, const char *name)
     tbl[min_i].count = inherited + 1;
 }
 
-void stats_record(const char *qname, bool blocked)
+void stats_record(const char *qname, verdict_t verdict)
 {
     xSemaphoreTake(s_lock, portMAX_DELAY);
     roll_hours();
     s_hourly_q[s_hour]++;
     top_bump(s_top_queried, qname);
-    if (blocked) {
+    if (verdict == VERDICT_BLOCK) {
         s_blocked++;
         s_hourly_b[s_hour]++;
         top_bump(s_top_blocked, qname);
     }
+
+    stats_recent_t *r = &s_recent[s_recent_head];
+    strlcpy(r->name, qname, STATS_NAME_MAX);
+    r->at_s    = uptime_s();
+    r->verdict = (uint8_t)verdict;
+    s_recent_head = (s_recent_head + 1) % STATS_RECENT;
+
     xSemaphoreGive(s_lock);
 }
 
@@ -102,6 +111,8 @@ void stats_snapshot(stats_snapshot_t *out)
     memcpy(out->hourly_b,    s_hourly_b,    sizeof(s_hourly_b));
     memcpy(out->top_blocked, s_top_blocked, sizeof(s_top_blocked));
     memcpy(out->top_queried, s_top_queried, sizeof(s_top_queried));
+    memcpy(out->recent,      s_recent,      sizeof(s_recent));
+    out->recent_head = s_recent_head;
     xSemaphoreGive(s_lock);
 
     out->uptime_s      = uptime_s();

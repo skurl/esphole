@@ -47,11 +47,27 @@ the implied false-positive rate. At 250k entries a 32-bit hash collides ~7 times
 roughly a 1-in-17,000 chance that a given *non-blocked* domain false-positives into
 the list. If a site breaks, add it to the allowlist and rebuild.
 
-## Router configuration
+## Deploying on your network
 
-Set the ESP32's static IP as **DHCP option 6 (DNS server)** on your router, then renew
-leases (or reboot clients). **Set a secondary DNS to your router or an upstream resolver
-while testing** — see "This is a single point of failure" below.
+**Network-wide, if your router allows it.** Set the ESP32's static IP as **DHCP option 6
+(DNS server)**, then renew leases (or reboot clients) — they keep the old resolver until
+their lease renews.
+
+**Per device, if it doesn't.** Many ISP routers (Sky Hubs among them) ship with the DHCP
+DNS fields removed, and there is no way around it in the stock UI. Set DNS on each device
+instead:
+
+```bash
+networksetup -setdnsservers Wi-Fi 192.168.0.53
+```
+
+Revert with `networksetup -setdnsservers Wi-Fi Empty`. On iOS: Wi-Fi → the network →
+Configure DNS → Manual. Don't list the router as a secondary — the OS will use either
+resolver, so some queries silently skip the sinkhole and you lose the signal about what
+is actually being blocked.
+
+Whichever route you take, keep a way back: this device becomes a single point of failure
+for every name lookup that uses it.
 
 ## Acceptance tests
 
@@ -172,6 +188,9 @@ inline CSS and JS, no CDN, since the device can't proxy one) polling `/api/stats
 every 5s. It shows total queries, blocks, block rate, free heap, a 24-hour
 bar chart, and top blocked/queried domains.
 
+It also shows the **recent query log** (last 40, newest first, tagged forward / block /
+allow / rewrite) and edits the **allowlist** and **rewrites** live.
+
 The page is embedded in the firmware via `EMBED_FILES`, not stored on a filesystem —
 there is no SPIFFS partition, because the blocklist owns all the flash the app doesn't.
 The HTTP task runs at priority 3, below the DNS listener (6) and workers (5), so a
@@ -187,6 +206,54 @@ Exact counts would mean retaining every domain seen, which the RAM doesn't allow
 Feature set inspired by [twedds95/ESP_hole](https://github.com/twedds95/ESP_hole)
 (MPL-2.0). No code was copied from it — that project is Arduino/PlatformIO with bloom
 filters and an async web server, none of which ports to this design.
+
+### Allowlist and rewrites
+
+The blocklist partition is immutable, so without this an over-broad entry means
+rebuilding the blob and reflashing. Both lists live in NVS, hold up to 32 entries each,
+survive reboots, and are edited from the dashboard or `curl`:
+
+```bash
+curl -X POST -d 'd=example.com' http://192.168.0.53/api/allow
+```
+
+```bash
+curl -X POST -d 'd=nas.home&ip=192.168.0.10' http://192.168.0.53/api/rewrite
+```
+
+Add `/del` to either path to remove an entry. Both match the domain **and all its
+subdomains**, so allowing `example.com` also allows `a.b.example.com`.
+
+Resolution order per query: rewrite → allowlist → blocklist → forward. A rewrite is an
+explicit instruction and a allowlist entry an explicit exemption, so both outrank the
+blob.
+
+> **An allowlist entry cannot override the upstream resolver.** The default upstream is
+> AdGuard (`94.140.14.14`), which filters ads itself. Allowlist `doubleclick.net` and
+> the device will dutifully forward the query — and AdGuard will return `0.0.0.0`
+> anyway. If allowlisting appears to do nothing, that is why. Set `UPSTREAM_DNS` to
+> `1.1.1.1` in `secrets.h` for an unfiltered upstream where the allowlist is the final
+> word. It's a real trade: AdGuard catches what the local list misses, at the cost of a
+> second blocklist you can't edit.
+
+### First-run provisioning
+
+With no credentials in NVS and none in `secrets.h`, the device raises a setup AP
+(`esphole-setup`, password `esphole-setup`) instead of joining anything. Connect to it
+and the captive portal opens at `http://192.168.4.1/` — the DNS server runs in captive
+mode, answering every query with its own address, so the setup page appears by itself.
+Enter the network name and password; credentials are stored in NVS and the device
+reboots into station mode.
+
+NVS credentials always win over `secrets.h`. To force provisioning again:
+
+```bash
+idf.py -p /dev/cu.usbserial-310 erase-flash
+```
+
+That wipes the blocklist partition too, so reflash `blocklist.bin` afterwards.
+
+Credentials are sent in a POST body, never a query string — URLs end up in logs.
 
 ### WiFi
 
@@ -243,6 +310,8 @@ else on the list has moved.
 | A site broke | Hash collision (~1 in 17,000) or an over-broad list entry. Add it to `--allowlist` and rebuild. |
 | Blocking works, forwarding times out | `UPSTREAM_DNS` in `secrets.h` points at this device, or the upstream is unreachable. |
 | dig times out entirely | Static IP collides with the DHCP pool, or the device is stuck reconnecting — check the serial console. |
+| Allowlisting a domain changes nothing | The upstream is filtering it too. Check with `dig @94.140.14.14 <domain>`; if that returns `0.0.0.0`, switch `UPSTREAM_DNS` to `1.1.1.1`. |
+| Dashboard unreachable but DNS works | `httpd_start` failed at boot (check the log). DNS is unaffected — the HTTP server is deliberately isolated from it. |
 | Slow first lookups after boot | Flash cache is cold in read mode. It settles. |
 
 ## Layout
@@ -251,7 +320,12 @@ else on the list has moved.
 main/fnv1a.h        hash, shared with Python via the parity test
 main/blocklist.c    partition mmap + read fallback, binary search, suffix walk
 main/dns_server.c   :53 listener, parser, sinkhole responder, upstream forwarder
-main/wifi.c         station mode, static IP, backoff reconnect
+main/overrides.c    NVS allowlist + rewrites, consulted before the blob
+main/stats.c        counters, 24h rings, top-N tables, recent query log
+main/http_server.c  :80 dashboard and JSON API
+main/dashboard.html embedded via EMBED_FILES, no external assets
+main/provision.html first-run setup portal
+main/wifi.c         NVS/secrets.h credentials, static IP, backoff reconnect, setup AP
 tools/              blob builder, parity test, matching test, fuzzer
 ```
 

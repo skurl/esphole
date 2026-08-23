@@ -1,6 +1,7 @@
 #include "blocklist.h"
 #include "dns_server.h"
 #include "http_server.h"
+#include "overrides.h"
 #include "stats.h"
 #include "wifi.h"
 
@@ -50,12 +51,18 @@ void app_main(void)
 #endif
 
     stats_init();
+    overrides_init();
     blocklist_init();
     if (!blocklist_ready()) {
         ESP_LOGW(TAG, "no usable blocklist — running as a plain forwarder");
     }
 
     wifi_start_and_wait();
+    if (wifi_is_provisioning()) {
+        /* Captive portal: resolve everything to ourselves so the setup page
+           pops up on its own. No uplink exists yet, so nothing to forward to. */
+        dns_server_set_captive(wifi_ip_str());
+    }
     dns_server_start();
     http_server_start();
 

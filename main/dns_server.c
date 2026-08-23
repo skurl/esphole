@@ -1,5 +1,6 @@
 #include "dns_server.h"
 #include "blocklist.h"
+#include "overrides.h"
 #include "stats.h"
 #include "secrets.h"
 
@@ -8,6 +9,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include "lwip/ip_addr.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -36,6 +38,9 @@ typedef struct {
 
 static int          s_sock = -1;
 static QueueHandle_t s_queue;
+static uint32_t     s_captive_ip;       /* non-zero while the setup AP is up */
+
+void dns_server_set_captive(const char *ip) { s_captive_ip = ipaddr_addr(ip); }
 
 /* ---- parsing -------------------------------------------------------------
    Every read is bounds-checked against the datagram length. This is the only
@@ -85,7 +90,8 @@ static int parse_question(const uint8_t *p, int len, char *name, int namesz,
 
 /* Header + question copied verbatim from the query; counts rewritten.
    ARCOUNT=0 drops any EDNS0 OPT record rather than echoing it back. */
-static int build_reply(const uint8_t *q, int qend, uint8_t *out, bool answer_a, uint8_t rcode)
+static int build_reply(const uint8_t *q, int qend, uint8_t *out, bool answer_a,
+                       uint8_t rcode, uint32_t ip_be)
 {
     memcpy(out, q, qend);
     out[2] = (uint8_t)(0x80 | (q[2] & 0x01));       /* QR=1, opcode 0, RD copied */
@@ -99,9 +105,10 @@ static int build_reply(const uint8_t *q, int qend, uint8_t *out, bool answer_a, 
         0xC0, 0x0C,                 /* name -> offset 12 */
         0x00, 0x01, 0x00, 0x01,     /* type A, class IN */
         0x00, 0x00, 0x00, 0x3C,     /* TTL 60 */
-        0x00, 0x04, 0x00, 0x00, 0x00, 0x00, /* rdlen 4, 0.0.0.0 */
+        0x00, 0x04, 0x00, 0x00, 0x00, 0x00, /* rdlen 4, address patched below */
     };
     memcpy(out + qend, a_rr, sizeof(a_rr));
+    memcpy(out + qend + 12, &ip_be, 4);     /* 0 for the sinkhole, else the rewrite */
     return qend + (int)sizeof(a_rr);
 }
 
@@ -137,7 +144,7 @@ static void forward(const job_t *j, uint8_t *out, int qend)
         close(us);
     }
     stats_note_upstream_fail();
-    reply(j, out, build_reply(j->buf, qend, out, false, 2));  /* SERVFAIL */
+    reply(j, out, build_reply(j->buf, qend, out, false, 2, 0));  /* SERVFAIL */
 }
 
 static void worker_task(void *arg)
@@ -157,13 +164,32 @@ static void worker_task(void *arg)
             continue;
         }
 
-        bool blocked = blocklist_blocked(name, namelen);
-        stats_record(name, blocked);
-        if (blocked) {
-            /* A -> 0.0.0.0; AAAA and everything else -> NODATA. */
-            reply(&j, out, build_reply(j.buf, qend, out, qtype == 1, 0));
+        if (s_captive_ip) {                 /* provisioning: everything is us */
+            stats_record(name, VERDICT_REWRITE);
+            reply(&j, out, build_reply(j.buf, qend, out, qtype == 1, 0, s_captive_ip));
             continue;
         }
+
+        /* Order matters: a rewrite is an explicit instruction, an allowlist
+           entry is an explicit exemption, and only then does the blob apply. */
+        uint32_t rw_ip;
+        if (overrides_rewrite(name, &rw_ip)) {
+            stats_record(name, VERDICT_REWRITE);
+            reply(&j, out, build_reply(j.buf, qend, out, qtype == 1, 0, rw_ip));
+            continue;
+        }
+        if (blocklist_blocked(name, namelen)) {
+            if (overrides_allowed(name)) {
+                stats_record(name, VERDICT_ALLOW);
+                forward(&j, out, qend);
+                continue;
+            }
+            stats_record(name, VERDICT_BLOCK);
+            /* A -> 0.0.0.0; AAAA and everything else -> NODATA. */
+            reply(&j, out, build_reply(j.buf, qend, out, qtype == 1, 0, 0));
+            continue;
+        }
+        stats_record(name, VERDICT_FORWARD);
         forward(&j, out, qend);
     }
 }
