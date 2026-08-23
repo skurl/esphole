@@ -1,0 +1,6 @@
+build/
+sdkconfig
+sdkconfig.old
+main/secrets.h
+blocklist.bin
+__pycache__/
