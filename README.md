@@ -228,13 +228,14 @@ Resolution order per query: rewrite → allowlist → blocklist → forward. A r
 explicit instruction and a allowlist entry an explicit exemption, so both outrank the
 blob.
 
-> **An allowlist entry cannot override the upstream resolver.** The default upstream is
-> AdGuard (`94.140.14.14`), which filters ads itself. Allowlist `doubleclick.net` and
-> the device will dutifully forward the query — and AdGuard will return `0.0.0.0`
-> anyway. If allowlisting appears to do nothing, that is why. Set `UPSTREAM_DNS` to
-> `1.1.1.1` in `secrets.h` for an unfiltered upstream where the allowlist is the final
-> word. It's a real trade: AdGuard catches what the local list misses, at the cost of a
-> second blocklist you can't edit.
+> **An allowlist entry cannot override an upstream that filters too.** The default
+> upstream is Cloudflare (`1.1.1.1`), which does no filtering, so the local blocklist
+> and allowlist have the final say. If you switch `UPSTREAM_DNS` to a filtering
+> resolver like AdGuard (`94.140.14.14`), allowlisting `doubleclick.net` will forward
+> the query and AdGuard will still return `0.0.0.0`. Measured from a UK connection:
+> Cloudflare ~30ms, AdGuard ~54ms with ~1.5% SERVFAIL at the 2s timeout, Mullvad
+> (`194.242.2.4`) ~516ms — unusable. The filtering upstream buys a second layer of
+> blocking and costs you an allowlist that works.
 
 ### First-run provisioning
 
