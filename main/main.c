@@ -1,5 +1,7 @@
 #include "blocklist.h"
 #include "dns_server.h"
+#include "http_server.h"
+#include "stats.h"
 #include "wifi.h"
 
 #include "freertos/FreeRTOS.h"
@@ -47,6 +49,7 @@ void app_main(void)
     hash_selftest();
 #endif
 
+    stats_init();
     blocklist_init();
     if (!blocklist_ready()) {
         ESP_LOGW(TAG, "no usable blocklist — running as a plain forwarder");
@@ -54,6 +57,7 @@ void app_main(void)
 
     wifi_start_and_wait();
     dns_server_start();
+    http_server_start();
 
     /* Nothing left for app_main to do; the tasks own the device from here. */
     vTaskDelete(NULL);

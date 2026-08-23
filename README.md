@@ -165,6 +165,29 @@ A summary line goes to the log every 60s:
 I dns: q=4812 blocked=1633 fwd=3179 upfail=0 dropped=0 heap=142380
 ```
 
+### Dashboard
+
+`http://<esp-ip>/` serves a single self-contained page (5.7KB, no external assets —
+inline CSS and JS, no CDN, since the device can't proxy one) polling `/api/stats`
+every 5s. It shows total queries, blocks, block rate, free heap, a 24-hour
+bar chart, and top blocked/queried domains.
+
+The page is embedded in the firmware via `EMBED_FILES`, not stored on a filesystem —
+there is no SPIFFS partition, because the blocklist owns all the flash the app doesn't.
+The HTTP task runs at priority 3, below the DNS listener (6) and workers (5), so a
+browser refreshing a chart can never delay name resolution.
+
+Hourly buckets are keyed on **uptime**, not wall clock: there is no RTC and no SNTP, so
+"last 24 hours" means the last 24 hours the device has been powered.
+
+Top-domain tables use Space-Saving with `STATS_TOP_N` slots. Heavy hitters are always
+present and correctly ranked; the counts are upper bounds, so tail entries read high.
+Exact counts would mean retaining every domain seen, which the RAM doesn't allow.
+
+Feature set inspired by [twedds95/ESP_hole](https://github.com/twedds95/ESP_hole)
+(MPL-2.0). No code was copied from it — that project is Arduino/PlatformIO with bloom
+filters and an async web server, none of which ports to this design.
+
 ### WiFi
 
 Station mode, credentials and static IP from `secrets.h` (gitignored; copy
@@ -206,7 +229,10 @@ reboots, drops off WiFi, or you re-flash it, every client on the network loses D
 Configure a secondary DNS server on the router during testing.
 
 Also out of scope: DoH/DoT upstream, DNSSEC validation, IPv6/AAAA sinkholing, TCP DNS
-on port 53, a web UI, and a DHCP server.
+on port 53, and a DHCP server.
+
+A web UI *was* on this list and has since been built — see **Dashboard** above. Nothing
+else on the list has moved.
 
 ## Troubleshooting
 

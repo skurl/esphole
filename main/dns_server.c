@@ -1,8 +1,10 @@
 #include "dns_server.h"
 #include "blocklist.h"
+#include "stats.h"
 #include "secrets.h"
 
 #include <string.h>
+#include <stdlib.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -34,10 +36,6 @@ typedef struct {
 
 static int          s_sock = -1;
 static QueueHandle_t s_queue;
-
-static struct {
-    uint32_t queries, blocked, forwarded, upstream_fail, dropped;
-} s_stats;
 
 /* ---- parsing -------------------------------------------------------------
    Every read is bounds-checked against the datagram length. This is the only
@@ -132,13 +130,13 @@ static void forward(const job_t *j, uint8_t *out, int qend)
             if (n >= 12 && memcmp(out, j->buf, 2) == 0) {  /* ID must match */
                 close(us);
                 reply(j, out, n);
-                s_stats.forwarded++;
+                stats_note_forwarded();
                 return;
             }
         }
         close(us);
     }
-    s_stats.upstream_fail++;
+    stats_note_upstream_fail();
     reply(j, out, build_reply(j->buf, qend, out, false, 2));  /* SERVFAIL */
 }
 
@@ -155,12 +153,13 @@ static void worker_task(void *arg)
         uint16_t qtype, qclass;
         if (parse_question(j.buf, j.len, name, sizeof(name),
                            &qend, &qtype, &qclass, &namelen) != 0) {
-            s_stats.dropped++;
+            stats_note_drop();
             continue;
         }
 
-        if (blocklist_blocked(name, namelen)) {
-            s_stats.blocked++;
+        bool blocked = blocklist_blocked(name, namelen);
+        stats_record(name, blocked);
+        if (blocked) {
             /* A -> 0.0.0.0; AAAA and everything else -> NODATA. */
             reply(&j, out, build_reply(j.buf, qend, out, qtype == 1, 0));
             continue;
@@ -182,21 +181,24 @@ static void listener_task(void *arg)
         }
         /* Counted before the zero-length check so the stats line balances:
            queries == blocked + forwarded + upstream_fail + dropped. */
-        s_stats.queries++;
-        if (n == 0) { s_stats.dropped++; continue; }
+        stats_note_query();
+        if (n == 0) { stats_note_drop(); continue; }
         j.len = n;
-        if (xQueueSend(s_queue, &j, 0) != pdTRUE) s_stats.dropped++;
+        if (xQueueSend(s_queue, &j, 0) != pdTRUE) stats_note_drop();
     }
 }
 
 static void stats_task(void *arg)
 {
+    stats_snapshot_t *s = malloc(sizeof(*s));
+    if (!s) vTaskDelete(NULL);
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(60000));
+        stats_snapshot(s);
         ESP_LOGI(TAG, "q=%lu blocked=%lu fwd=%lu upfail=%lu dropped=%lu heap=%lu",
-                 (unsigned long)s_stats.queries, (unsigned long)s_stats.blocked,
-                 (unsigned long)s_stats.forwarded, (unsigned long)s_stats.upstream_fail,
-                 (unsigned long)s_stats.dropped, (unsigned long)esp_get_free_heap_size());
+                 (unsigned long)s->queries, (unsigned long)s->blocked,
+                 (unsigned long)s->forwarded, (unsigned long)s->upstream_fail,
+                 (unsigned long)s->dropped, (unsigned long)s->free_heap);
     }
 }
 
