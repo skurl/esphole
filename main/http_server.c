@@ -19,9 +19,32 @@ extern const uint8_t dashboard_html_end[]   asm("_binary_dashboard_html_end");
 extern const uint8_t provision_html_start[] asm("_binary_provision_html_start");
 extern const uint8_t provision_html_end[]   asm("_binary_provision_html_end");
 
-#define JSON_MAX  8192
+#define JSON_MAX  16384
 #define BODY_MAX  512
 #define CHUNK     4096      /* one flash sector per write */
+
+/* snprintf returns the length it wanted, not what it wrote, so a naive
+   JSON_MAX - n goes negative once the buffer is full and wraps to a huge
+   size_t. This keeps every write bounded; a payload that outgrows the buffer
+   is cut, never overrun. */
+#define LEFT(n) ((n) < JSON_MAX ? (size_t)(JSON_MAX - (n)) : 0)
+
+/* DNS labels may hold any octet — the fuzzer proved it by putting a BEL in a
+   name that then landed in the stats. Escape quote, backslash and anything
+   outside printable ASCII so the dashboard can always parse what we send. */
+static int json_str(char *out, size_t max, const char *s)
+{
+    int n = 0;
+    for (; *s && n + 7 < (int)max; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\')          n += snprintf(out + n, max - n, "\\%c", c);
+        else if (c < 0x20 || c > 0x7E)       n += snprintf(out + n, max - n, "\\u%04x", c);
+        else                                 out[n++] = (char)c;
+    }
+    out[n] = '\0';
+    return n;
+}
+#define ESC_MAX (STATS_NAME_MAX * 6 + 1)
 
 /* ---- request body helpers -------------------------------------------------
    Everything is form-encoded in a POST body rather than a query string:
@@ -104,17 +127,21 @@ static esp_err_t page_get(httpd_req_t *req)
                            dashboard_html_end - dashboard_html_start - 1);
 }
 
+#define SL(n, left) ((n) < (int)(left) ? (left) - (n) : 0)
+
 static int append_top(char *p, size_t left, const stats_entry_t *t)
 {
     int n = 0, first = 1;
-    n += snprintf(p + n, left - n, "[");
+    char e[ESC_MAX];
+    n += snprintf(p + n, SL(n, left), "[");
     for (int i = 0; i < STATS_TOP_N; i++) {
         if (t[i].count == 0) continue;
-        n += snprintf(p + n, left - n, "%s{\"n\":\"%s\",\"c\":%lu}",
-                      first ? "" : ",", t[i].name, (unsigned long)t[i].count);
+        json_str(e, sizeof(e), t[i].name);
+        n += snprintf(p + n, SL(n, left), "%s{\"n\":\"%s\",\"c\":%lu}",
+                      first ? "" : ",", e, (unsigned long)t[i].count);
         first = 0;
     }
-    n += snprintf(p + n, left - n, "]");
+    n += snprintf(p + n, SL(n, left), "]");
     return n;
 }
 
@@ -143,34 +170,37 @@ static esp_err_t stats_get(httpd_req_t *req)
         (unsigned long)blocklist_count(), blocklist_ready() ? "true" : "false",
         wifi_upstream_dns(), wifi_ip_str(), (unsigned long)s->hour_index);
 
-    n += snprintf(json + n, JSON_MAX - n, "\"hourly_q\":[");
+    n += snprintf(json + n, LEFT(n), "\"hourly_q\":[");
     for (int i = 0; i < STATS_HOURS; i++)
-        n += snprintf(json + n, JSON_MAX - n, "%s%lu", i ? "," : "",
+        n += snprintf(json + n, LEFT(n), "%s%lu", i ? "," : "",
                       (unsigned long)s->hourly_q[i]);
-    n += snprintf(json + n, JSON_MAX - n, "],\"hourly_b\":[");
+    n += snprintf(json + n, LEFT(n), "],\"hourly_b\":[");
     for (int i = 0; i < STATS_HOURS; i++)
-        n += snprintf(json + n, JSON_MAX - n, "%s%lu", i ? "," : "",
+        n += snprintf(json + n, LEFT(n), "%s%lu", i ? "," : "",
                       (unsigned long)s->hourly_b[i]);
-    n += snprintf(json + n, JSON_MAX - n, "],\"top_blocked\":");
-    n += append_top(json + n, JSON_MAX - n, s->top_blocked);
-    n += snprintf(json + n, JSON_MAX - n, ",\"top_queried\":");
-    n += append_top(json + n, JSON_MAX - n, s->top_queried);
+    n += snprintf(json + n, LEFT(n), "],\"top_blocked\":");
+    n += append_top(json + n, LEFT(n), s->top_blocked);
+    n += snprintf(json + n, LEFT(n), ",\"top_queried\":");
+    n += append_top(json + n, LEFT(n), s->top_queried);
 
     /* Newest first: walk backwards from the ring head. */
-    n += snprintf(json + n, JSON_MAX - n, ",\"recent\":[");
+    n += snprintf(json + n, LEFT(n), ",\"recent\":[");
     int first = 1;
+    char e[ESC_MAX];
     for (int i = 1; i <= STATS_RECENT; i++) {
         const stats_recent_t *r =
             &s->recent[(s->recent_head + STATS_RECENT - i) % STATS_RECENT];
         if (r->name[0] == '\0') continue;
-        n += snprintf(json + n, JSON_MAX - n, "%s{\"n\":\"%s\",\"v\":%u,\"a\":%lu}",
-                      first ? "" : ",", r->name, r->verdict,
+        json_str(e, sizeof(e), r->name);
+        n += snprintf(json + n, LEFT(n), "%s{\"n\":\"%s\",\"v\":%u,\"a\":%lu}",
+                      first ? "" : ",", e, r->verdict,
                       (unsigned long)(s->uptime_s - r->at_s));
         first = 0;
     }
-    n += snprintf(json + n, JSON_MAX - n, "],");
-    n += overrides_json(json + n, JSON_MAX - n);
-    n += snprintf(json + n, JSON_MAX - n, "}");
+    n += snprintf(json + n, LEFT(n), "],");
+    n += overrides_json(json + n, LEFT(n));
+    n += snprintf(json + n, LEFT(n), "}");
+    if (n > JSON_MAX - 1) n = JSON_MAX - 1;   /* truncated, never overrun */
 
     httpd_resp_set_type(req, "application/json");
     esp_err_t err = httpd_resp_send(req, json, n);
