@@ -7,6 +7,10 @@ nothing, while everything else is forwarded to a real resolver and answered
 normally. Same idea as Pi-hole, on hardware that costs a few pounds and draws
 about half a watt.
 
+It's got a nice dashboard as well
+
+![](./visuals/DASHBOARD.jpeg)
+
 ## What it does
 
 - **Blocks ~93,000 ad and tracker domains** from the usual public blocklists,
@@ -55,6 +59,3 @@ log prints its address; the dashboard is on port 80.
 
 Working and running on hardware. Verified against malformed traffic, sustained
 query load, and WiFi dropouts.
-
-Full design notes, wire formats and troubleshooting live in this file's earlier
-revisions (`git log -p README.md`) and in the source comments.
