@@ -21,6 +21,7 @@ extern const uint8_t provision_html_end[]   asm("_binary_provision_html_end");
 
 #define JSON_MAX  8192
 #define BODY_MAX  512
+#define CHUNK     4096      /* one flash sector per write */
 
 /* ---- request body helpers -------------------------------------------------
    Everything is form-encoded in a POST body rather than a query string:
@@ -79,10 +80,11 @@ static esp_err_t reply_err(httpd_req_t *req, esp_err_t e)
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"ok\":true}");
     }
-    const char *msg = e == ESP_ERR_NO_MEM      ? "list full"
-                    : e == ESP_ERR_INVALID_ARG ? "invalid domain or IP"
-                    : e == ESP_ERR_NOT_FOUND   ? "not found"
-                                               : "failed";
+    const char *msg = e == ESP_ERR_NO_MEM        ? "list full"
+                    : e == ESP_ERR_INVALID_ARG   ? "invalid input"
+                    : e == ESP_ERR_INVALID_SIZE  ? "wrong size for this partition"
+                    : e == ESP_ERR_NOT_FOUND     ? "not found"
+                                                 : "failed";
     httpd_resp_set_status(req, "400 Bad Request");
     httpd_resp_set_type(req, "application/json");
     char b[96];
@@ -197,6 +199,61 @@ static esp_err_t rewrite_post(httpd_req_t *req)
     return reply_err(req, overrides_rw_add(d, ip));
 }
 
+/* Raw blocklist.bin as the POST body, streamed to flash a sector at a time.
+   curl -X POST --data-binary @blocklist.bin http://<ip>/api/blocklist */
+static esp_err_t blocklist_post(httpd_req_t *req)
+{
+    size_t total = req->content_len;
+    if (total < 16) return reply_err(req, ESP_ERR_INVALID_SIZE);
+
+    uint8_t *chunk = malloc(CHUNK);
+    if (!chunk) return reply_err(req, ESP_ERR_NO_MEM);
+
+    uint8_t hdr[16];
+    uint32_t count = 0;
+    esp_err_t err = ESP_OK;
+    size_t off = 0;
+
+    while (off < total) {
+        int want = (int)((total - off < CHUNK) ? total - off : CHUNK);
+        int got = 0;
+        while (got < want) {
+            int r = httpd_req_recv(req, (char *)chunk + got, want - got);
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+            if (r <= 0) { err = ESP_FAIL; goto done; }
+            got += r;
+        }
+        if (off == 0) {
+            /* Nothing is erased until the header proves this is a blocklist. */
+            if (!blocklist_header_ok(chunk, total, &count)) {
+                err = ESP_ERR_INVALID_ARG;
+                goto done;
+            }
+            memcpy(hdr, chunk, 16);
+            if ((err = blocklist_update_begin(total)) != ESP_OK) goto done;
+            if (got > 16 && (err = blocklist_update_write(16, chunk + 16, got - 16)) != ESP_OK)
+                goto done;
+        } else if ((err = blocklist_update_write(off, chunk, got)) != ESP_OK) {
+            goto done;
+        }
+        off += got;
+    }
+    err = blocklist_update_end(hdr);
+
+done:
+    free(chunk);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "blocklist update failed at %u/%u: %s",
+                 (unsigned)off, (unsigned)total, esp_err_to_name(err));
+        return reply_err(req, err);
+    }
+    ESP_LOGI(TAG, "blocklist updated: %lu hashes", (unsigned long)count);
+    char b[64];
+    snprintf(b, sizeof(b), "{\"ok\":true,\"count\":%lu}", (unsigned long)count);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, b);
+}
+
 static esp_err_t wifi_post(httpd_req_t *req)
 {
     char body[BODY_MAX], ssid[33], pass[65];
@@ -224,6 +281,7 @@ void http_server_start(void)
     cfg.stack_size = 6144;
     cfg.lru_purge_enable = true;
     cfg.max_uri_handlers = 10;
+    cfg.recv_wait_timeout = 10;     /* a 400KB upload over marginal WiFi */
     /* Below the DNS tasks on purpose: name resolution must never wait on a
        browser refreshing a chart. */
     cfg.task_priority = 3;
@@ -242,6 +300,7 @@ void http_server_start(void)
         { .uri = "/api/rewrite",      .method = HTTP_POST, .handler = rewrite_post },
         { .uri = "/api/rewrite/del",  .method = HTTP_POST, .handler = rewrite_post },
         { .uri = "/api/wifi",         .method = HTTP_POST, .handler = wifi_post },
+        { .uri = "/api/blocklist",    .method = HTTP_POST, .handler = blocklist_post },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(*routes); i++)
         httpd_register_uri_handler(srv, &routes[i]);

@@ -103,7 +103,10 @@ def main() -> int:
 
     pct = 100 * size / PARTITION_SIZE
     print(f"\nwrote {args.out}: {size} bytes ({pct:.1f}% of partition)")
-    print(f"\n  esptool --chip esp32 write-flash {FLASH_OFFSET:#x} {args.out}\n"
+    print(f"\nOver WiFi, no cable (device stays up, fails open for a few seconds):\n"
+          f"  curl -X POST --data-binary @{args.out} http://<esp-ip>/api/blocklist\n"
+          f"\nOr over USB:\n"
+          f"  esptool --chip esp32 write-flash {FLASH_OFFSET:#x} {args.out}\n"
           "  (esptool 4.x, e.g. the one bundled in an IDF shell: write_flash)\n")
     return 0
 

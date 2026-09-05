@@ -25,15 +25,28 @@ static esp_partition_mmap_handle_t s_map;
 static uint32_t                 s_count;
 static bool                     s_ready;
 
-void blocklist_init(void)
-{
-    s_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "blocklist");
-    if (!s_part) {
-        ESP_LOGE(TAG, "no blocklist partition — forwarding everything");
-        return;
-    }
+typedef struct { uint32_t magic, count, algo, reserved; } hdr_t;
 
-    struct { uint32_t magic, count, algo, reserved; } hdr;
+bool blocklist_header_ok(const void *hdr16, size_t total_len, uint32_t *count)
+{
+    hdr_t h;
+    memcpy(&h, hdr16, sizeof(h));
+    if (h.magic != BLK_MAGIC || h.algo != ALGO_FNV1A32) return false;
+    if ((uint64_t)HDR_SIZE + (uint64_t)h.count * 4 != total_len) return false;
+    if (s_part && total_len > s_part->size) return false;
+    if (count) *count = h.count;
+    return true;
+}
+
+/* Reads and validates the header, then arms lookups. Safe to call again after
+   the partition has been rewritten: the mapping covers the whole partition, so
+   only the count needs refreshing. */
+static void load(void)
+{
+    s_ready = false;
+    s_count = 0;
+
+    hdr_t hdr;
     if (esp_partition_read(s_part, 0, &hdr, sizeof(hdr)) != ESP_OK) {
         ESP_LOGE(TAG, "header read failed — forwarding everything");
         return;
@@ -48,23 +61,68 @@ void blocklist_init(void)
                  (unsigned long)hdr.count);
         return;
     }
-
     s_count = hdr.count;
+    s_ready = s_count > 0;
+    ESP_LOGI(TAG, "%s mode, %lu hashes", s_hashes ? "mmap" : "read",
+             (unsigned long)s_count);
+}
+
+void blocklist_init(void)
+{
+    s_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x40, "blocklist");
+    if (!s_part) {
+        ESP_LOGE(TAG, "no blocklist partition — forwarding everything");
+        return;
+    }
 
     /* mmap of 2.5MB can fail depending on what else holds DROM window space.
        That is expected, not fatal: fall back to ~20 four-byte partition reads
-       per lookup, which costs no address space and is still sub-millisecond. */
+       per lookup, which costs no address space and is still sub-millisecond.
+       Mapped once for the whole partition and never unmapped: a rewrite goes
+       through esp_partition_write, which flushes the flash cache, so the same
+       mapping simply shows the new bytes. */
     const void *ptr;
     esp_err_t err = esp_partition_mmap(s_part, 0, s_part->size,
                                        ESP_PARTITION_MMAP_DATA, &ptr, &s_map);
     if (err == ESP_OK) {
         s_hashes = (const uint32_t *)((const uint8_t *)ptr + HDR_SIZE);
-        ESP_LOGI(TAG, "mmap mode, %lu hashes", (unsigned long)s_count);
     } else {
-        ESP_LOGW(TAG, "mmap failed (%s), using read mode, %lu hashes",
-                 esp_err_to_name(err), (unsigned long)s_count);
+        ESP_LOGW(TAG, "mmap failed (%s), falling back to read mode", esp_err_to_name(err));
     }
-    s_ready = s_count > 0;
+    load();
+}
+
+esp_err_t blocklist_update_begin(size_t total_len)
+{
+    if (!s_part) return ESP_ERR_INVALID_STATE;
+    if (total_len < HDR_SIZE || total_len > s_part->size) return ESP_ERR_INVALID_SIZE;
+
+    /* Fail open for the duration. ponytail: a worker that passed this check a
+       microsecond ago reads erased flash for one query and answers wrong once.
+       Flash ops stall both cores anyway, so the window is tiny; a rwlock here
+       would cost every query to protect a reload that happens weekly. */
+    s_ready = false;
+    s_count = 0;
+
+    size_t erase_len = (total_len + 0xFFF) & ~(size_t)0xFFF;   /* 4KB sectors */
+    ESP_LOGW(TAG, "update: erasing %u bytes, forwarding everything meanwhile",
+             (unsigned)erase_len);
+    return esp_partition_erase_range(s_part, 0, erase_len);
+}
+
+esp_err_t blocklist_update_write(size_t off, const void *data, size_t len)
+{
+    if (!s_part || off < HDR_SIZE || off + len > s_part->size) return ESP_ERR_INVALID_SIZE;
+    return esp_partition_write(s_part, off, data, len);
+}
+
+esp_err_t blocklist_update_end(const void *hdr16)
+{
+    if (!s_part) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = esp_partition_write(s_part, 0, hdr16, HDR_SIZE);
+    if (err != ESP_OK) return err;
+    load();
+    return s_ready ? ESP_OK : ESP_FAIL;
 }
 
 bool     blocklist_ready(void) { return s_ready; }

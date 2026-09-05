@@ -45,6 +45,9 @@ form.add input{flex:1;min-width:0;padding:7px 10px;background:var(--bg);border:1
 form.add input.ip{flex:0 0 118px}
 form.add input:focus{outline:none;border-color:var(--blue)}
 form.add button{padding:7px 14px;background:var(--blue);color:#06121f;border:0;border-radius:6px;font-weight:600;font-size:13px;cursor:pointer}
+form.add button:disabled{opacity:.5;cursor:default}
+form.add input[type=file]{padding:5px 8px;color:var(--dim)}
+.ok{color:var(--grn);font-size:12px;min-height:16px;margin-bottom:8px}
 .del{background:none;border:0;color:var(--dim);cursor:pointer;font-size:15px;padding:0 2px;line-height:1}
 .del:hover{color:var(--red)}
 .err{color:var(--red);font-size:12px;min-height:16px;margin-bottom:8px}
@@ -97,6 +100,18 @@ form.add button{padding:7px 14px;background:var(--blue);color:#06121f;border:0;b
     </form>
     <div id="rl"></div>
   </div>
+</div>
+
+<div class="panel">
+  <h2>Blocklist</h2>
+  <div id="be" class="err"></div>
+  <form class="add" id="bf">
+    <input type="file" id="bfile" accept=".bin" required>
+    <button id="bbtn">Upload</button>
+  </form>
+  <div class="empty">Replaces the list in place over WiFi — no cable, no reboot. The device
+  forwards everything for a few seconds while it writes. Build one with
+  <code>tools/build_blocklist.py</code>.</div>
 </div>
 
 <footer>
@@ -171,6 +186,20 @@ $('rf').addEventListener('submit',async e=>{
   if(await post('/api/rewrite',{d:$('rd').value,ip:$('ri').value},$('re'))){
     $('rd').value='';$('ri').value='';
   }
+});
+$('bf').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const f=$('bfile').files[0], el=$('be'), btn=$('bbtn');
+  if(!f)return;
+  el.className='err'; el.textContent=''; btn.disabled=true; btn.textContent='Uploading…';
+  try{
+    const r=await fetch('/api/blocklist',{method:'POST',body:f});
+    const j=await r.json();
+    if(!j.ok)throw new Error(j.error||'failed');
+    el.className='ok'; el.textContent=`Loaded ${n(j.count)} domains`;
+    $('bfile').value=''; await tick();
+  }catch(err){ el.className='err'; el.textContent=err.message||'upload failed' }
+  btn.disabled=false; btn.textContent='Upload';
 });
 document.addEventListener('click',e=>{
   const b=e.target.closest('.del'); if(!b)return;

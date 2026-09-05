@@ -24,7 +24,10 @@
 static const char *TAG = "dns";
 
 #define DNS_PORT    53
-#define MAX_PKT     512     /* plain DNS/UDP ceiling; EDNS0 is stripped anyway */
+/* DNS Flag Day 2020 size. 512 was the pre-EDNS limit and modern resolvers
+   routinely exceed it (CNAME chains, TXT, DNSSEC); anything we cannot fit gets
+   the TC bit so the client knows rather than choking on a fragment. */
+#define MAX_PKT     1232
 #define NWORKERS    4
 #define QUEUE_LEN   16
 #define UPSTREAM_TIMEOUT_S 2
@@ -136,6 +139,8 @@ static void forward(const job_t *j, uint8_t *out, int qend)
             int n = recv(us, out, MAX_PKT, 0);
             if (n >= 12 && memcmp(out, j->buf, 2) == 0) {  /* ID must match */
                 close(us);
+                /* A full buffer means lwIP discarded the tail. Say so. */
+                if (n == MAX_PKT) out[2] |= 0x02;           /* TC */
                 reply(j, out, n);
                 stats_note_forwarded();
                 return;
@@ -247,9 +252,9 @@ void dns_server_start(void)
 
     s_queue = xQueueCreate(QUEUE_LEN, sizeof(job_t));
     for (int i = 0; i < NWORKERS; i++) {
-        xTaskCreate(worker_task, "dns_worker", 4096, NULL, 5, NULL);
+        xTaskCreate(worker_task, "dns_worker", 6144, NULL, 5, NULL);
     }
-    xTaskCreate(listener_task, "dns_listen", 4096, NULL, 6, NULL);
+    xTaskCreate(listener_task, "dns_listen", 5120, NULL, 6, NULL);
     xTaskCreate(stats_task, "dns_stats", 3072, NULL, 1, NULL);
 
     ESP_LOGI(TAG, "listening on :53, upstream %s, %lu blocked hashes",

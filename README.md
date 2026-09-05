@@ -45,6 +45,10 @@ Flash the generated `blocklist.bin` to the blocklist partition, then set the
 device's IP as the DNS server on your router or on individual devices. The boot
 log prints its address; the dashboard is on port 80.
 
+After that, blocklist updates go over WiFi — upload the new `blocklist.bin`
+from the dashboard, or `curl -X POST --data-binary @blocklist.bin
+http://<esp-ip>/api/blocklist`. No cable, no reboot.
+
 ## What it won't do
 
 - **YouTube ads.** They come from the same servers as the video itself, so no
